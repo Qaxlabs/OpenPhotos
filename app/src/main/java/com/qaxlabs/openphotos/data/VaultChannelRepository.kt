@@ -123,8 +123,8 @@ class VaultChannelRepository @Inject constructor(
             candidateIds.addAll(res.chatIds.toList())
         }.onFailure { Log.w(TAG, "SearchChats failed: ${it.message}") }
 
-        // Strategy 3: Load and scan chat list pages from TDLib
-        repeat(MAX_SCAN_PAGES) {
+        // Strategy 3: Load and scan chat list pages from TDLib with retries for chat sync on fresh login
+        repeat(MAX_SCAN_PAGES) { attempt ->
             runCatching {
                 client.send(TdApi.LoadChats(TdApi.ChatListMain(), CHAT_PAGE_SIZE))
             }
@@ -135,8 +135,23 @@ class VaultChannelRepository @Inject constructor(
             if (chatsResult != null && chatsResult.chatIds.isNotEmpty()) {
                 candidateIds.addAll(chatsResult.chatIds.toList())
             }
+
+            // Evaluate candidates found so far
+            val matched = evaluateCandidates(candidateIds)
+            if (matched != null) {
+                return matched
+            }
+
+            // If not found yet, wait for TDLib to sync more chats from server before next attempt
+            if (attempt < MAX_SCAN_PAGES - 1) {
+                kotlinx.coroutines.delay(1500L)
+            }
         }
 
+        return evaluateCandidates(candidateIds)
+    }
+
+    private suspend fun evaluateCandidates(candidateIds: Set<Long>): Long? {
         if (candidateIds.isEmpty()) return null
 
         var bestChatId: Long? = null

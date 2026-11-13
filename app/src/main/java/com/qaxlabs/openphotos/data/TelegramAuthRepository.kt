@@ -90,10 +90,8 @@ class TelegramAuthRepository @Inject constructor(
 
     init {
         scope.launch {
-            // Start the TDLib client; updates begin flowing immediately.
-            client.create()
-
-            // Collect every TDLib update and forward auth-state changes.
+            // Collect every TDLib update and forward auth-state changes first
+            // so no initial update (e.g. WaitTdlibParameters) is dropped.
             launch {
                 client.updates.collect { update ->
                     if (update is TdApi.UpdateAuthorizationState) {
@@ -101,6 +99,9 @@ class TelegramAuthRepository @Inject constructor(
                     }
                 }
             }
+
+            // Start the TDLib client; updates begin flowing immediately.
+            client.create()
 
             // Actively query TDLib for its current authorization state on launch
             runCatching {
@@ -117,9 +118,14 @@ class TelegramAuthRepository @Inject constructor(
     // ── Internal state machine ─────────────────────────────────────────────
 
     private suspend fun handleAuthorizationState(state: TdApi.AuthorizationState) = authMutex.withLock {
+        handleAuthorizationStateUnlocked(state)
+    }
+
+    private suspend fun handleAuthorizationStateUnlocked(state: TdApi.AuthorizationState) {
+        Log.d(TAG, "Handling TDLib AuthorizationState: ${state.javaClass.simpleName}")
         when (state) {
             is TdApi.AuthorizationStateWaitTdlibParameters -> {
-                if (hasSentParameters) return@withLock
+                if (hasSentParameters) return
 
                 // Try to auto-initialise from saved credentials (subsequent launches).
                 val savedId   = secureStore.getApiId()
@@ -155,6 +161,8 @@ class TelegramAuthRepository @Inject constructor(
             }
 
             is TdApi.AuthorizationStateReady -> {
+                if (_authState.value is AuthState.Authenticated) return
+
                 // Fetch the user's phone number to display on the success screen.
                 val phone = try {
                     val me = client.send(TdApi.GetMe()) as TdApi.User
@@ -190,7 +198,9 @@ class TelegramAuthRepository @Inject constructor(
                 client.create()
             }
 
-            else -> { /* other states (e-mail code etc.) not handled in v1 */ }
+            else -> {
+                Log.w(TAG, "Unrecognized authorization state: ${state.javaClass.simpleName}")
+            }
         }
     }
 
@@ -249,6 +259,16 @@ class TelegramAuthRepository @Inject constructor(
         }
 
         client.send(params)
+
+        // Actively query TDLib for the updated authorization state immediately after parameters are applied
+        runCatching {
+            val currentState = client.send(TdApi.GetAuthorizationState())
+            if (currentState is TdApi.AuthorizationState) {
+                handleAuthorizationStateUnlocked(currentState)
+            }
+        }.onFailure { e ->
+            Log.w(TAG, "GetAuthorizationState after SetTdlibParameters failed: ${e.message}")
+        }
     }
 
     /** Submits the user's phone number (E.164 recommended, TDLib is lenient). */

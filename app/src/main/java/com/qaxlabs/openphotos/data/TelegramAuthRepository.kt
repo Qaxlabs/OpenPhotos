@@ -163,23 +163,22 @@ class TelegramAuthRepository @Inject constructor(
             is TdApi.AuthorizationStateReady -> {
                 if (_authState.value is AuthState.Authenticated) return
 
-                // Fetch the user's phone number to display on the success screen.
-                val phone = try {
-                    val me = client.send(TdApi.GetMe()) as TdApi.User
-                    // TDLib returns the phone without the leading "+".
-                    "+${me.phoneNumber}"
-                } catch (_: Exception) {
-                    secureStore.getPhoneNumber() ?: "unknown"
-                }
-                secureStore.setPhoneNumber(phone)
-                _authState.value = AuthState.Authenticated(phone)
+                val cachedPhone = secureStore.getPhoneNumber() ?: "unknown"
+                _authState.value = AuthState.Authenticated(cachedPhone)
 
-                // FR-INDEX-0: ensure the vault channel exists before any index
-                // operation (find existing or create new). Runs in a separate
-                // coroutine so it never delays the auth state update itself.
-                // FR-INDEX-2: pull remote index + hydrate Room after the channel
-                // is confirmed. Sequential: channel first, then sync.
+                // Fetch real phone number asynchronously
                 scope.launch {
+                    val phone = try {
+                        val me = client.send(TdApi.GetMe()) as TdApi.User
+                        "+${me.phoneNumber}"
+                    } catch (_: Exception) {
+                        cachedPhone
+                    }
+                    secureStore.setPhoneNumber(phone)
+                    if (phone != cachedPhone) {
+                        _authState.value = AuthState.Authenticated(phone)
+                    }
+
                     vaultChannelRepository.getOrCreateVaultChannel()
                     indexRepository.syncFromRemote()
                 }

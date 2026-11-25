@@ -2,6 +2,9 @@ package com.qaxlabs.openphotos.data.di
 
 import android.content.Context
 import androidx.room.Room
+import com.qaxlabs.openphotos.data.db.AlbumDao
+import com.qaxlabs.openphotos.data.db.BackupTaskDao
+import com.qaxlabs.openphotos.data.db.UnifiedMediaDao
 import com.qaxlabs.openphotos.data.db.UploadedItemDao
 import com.qaxlabs.openphotos.data.db.VaultDatabase
 import dagger.Module
@@ -23,12 +26,23 @@ object DatabaseModule {
             VaultDatabase::class.java,
             "vault_db",
         )
-            // v1: no existing users → destructive fallback is safe.
-            // Remove this once v2 ships with a proper Migration.
+            .addMigrations(VaultDatabase.MIGRATION_3_4)
             .fallbackToDestructiveMigration()
             .build()
 
     @Provides
     @Singleton
     fun provideUploadedItemDao(db: VaultDatabase): UploadedItemDao = db.uploadedItemDao()
+
+    @Provides
+    @Singleton
+    fun provideUnifiedMediaDao(db: VaultDatabase): UnifiedMediaDao = db.unifiedMediaDao()
+
+    @Provides
+    @Singleton
+    fun provideBackupTaskDao(db: VaultDatabase): BackupTaskDao = db.backupTaskDao()
+
+    @Provides
+    @Singleton
+    fun provideAlbumDao(db: VaultDatabase): AlbumDao = db.albumDao()
 }

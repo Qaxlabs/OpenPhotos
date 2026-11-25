@@ -19,10 +19,54 @@ import javax.inject.Inject
  * ARCHITECTURE CONTRACT (tech_stack.md §3):
  * This class does NOT import or reference any TDLib class.
  */
+import androidx.lifecycle.viewModelScope
+import com.qaxlabs.openphotos.data.db.BackupSessionEntity
+import com.qaxlabs.openphotos.data.engine.AdaptiveUploadScheduler
+import com.qaxlabs.openphotos.data.engine.BackupSessionManager
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+
+import com.qaxlabs.openphotos.data.db.BackupTaskDao
+import com.qaxlabs.openphotos.data.db.BackupTaskEntity
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+
+@OptIn(ExperimentalCoroutinesApi::class)
 @HiltViewModel
 class UploadViewModel @Inject constructor(
     private val uploadRepository: UploadRepository,
+    private val sessionManager: BackupSessionManager,
+    private val adaptiveScheduler: AdaptiveUploadScheduler,
+    private val backupTaskDao: BackupTaskDao,
 ) : ViewModel() {
+
+    /** Active backup session state. */
+    val activeSession: StateFlow<BackupSessionEntity?> = sessionManager.observeActiveSession()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = null,
+        )
+
+    /** Persistent backup tasks for current active session. */
+    val persistentTasks: StateFlow<List<BackupTaskEntity>> = activeSession
+        .flatMapLatest { session ->
+            if (session != null) {
+                backupTaskDao.observeTasksForSession(session.sessionId)
+            } else {
+                flowOf(emptyList())
+            }
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = emptyList(),
+        )
+
+    /** Adaptive upload scheduler flood wait state. */
+    val adaptiveFloodWaitState: StateFlow<FloodWaitState> = adaptiveScheduler.floodWaitState
 
     /** Full queue snapshot; each state change emits a new immutable list. */
     val queue: StateFlow<List<UploadQueueItem>> = uploadRepository.queue
@@ -64,9 +108,14 @@ class UploadViewModel @Inject constructor(
      * FR-UPLOAD-5: [UploadRepository.enqueue] immediately flags oversized items
      * before the processor loop starts.
      */
-    fun startUpload(items: List<MediaItem>) {
+    fun startUserBackupSession(items: List<MediaItem>) {
         uploadRepository.enqueue(items)
+        viewModelScope.launch {
+            sessionManager.startUserBackupSession(items)
+        }
     }
+
+    fun startUpload(items: List<MediaItem>) = startUserBackupSession(items)
 
     /**
      * Clears the queue so the user can start a fresh selection.
@@ -81,5 +130,24 @@ class UploadViewModel @Inject constructor(
      */
     fun retryUpload(itemId: String) {
         uploadRepository.retryItem(itemId)
+    }
+
+    fun pauseBackup() {
+        viewModelScope.launch {
+            sessionManager.pauseActiveSession()
+        }
+    }
+
+    fun resumeBackup() {
+        viewModelScope.launch {
+            sessionManager.resumeActiveSession()
+            adaptiveScheduler.executePendingTasks()
+        }
+    }
+
+    fun cancelBackup() {
+        viewModelScope.launch {
+            sessionManager.cancelActiveSession()
+        }
     }
 }

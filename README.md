@@ -1,125 +1,130 @@
-# OpenPhotos — Telegram-Backed Photo Vault
+# OpenPhotos — Telegram-Backed Photo Vault & Unified Media Gallery
 
-> **Free, open-source Android app giving you Google-Photos-style backup and gallery browsing, backed entirely by your own Telegram account.**
+> **Free, open-source Android application providing a seamless, Google-Photos-style unified gallery and automated backup, backed entirely by your personal Telegram account.**
 
----
-
-> ⚠️ **IMPORTANT SECURITY & PRIVACY NOTICE (v1 Scope)**
-> 
-> **Client-side file encryption is NOT implemented in v1.**
-> 
-> All media files are uploaded at original quality as raw Telegram Documents into your personal **Saved Messages** chat. Your files are protected **solely by Telegram's transport security (MTProto) and your Telegram account access controls**.
-> 
-> Anyone with access to your Telegram account or Saved Messages chat will be able to view these files. Opt-in portable client-side passphrase encryption is explicitly planned for **v2** (see [`docs/DRD.md`](docs/DRD.md) §5 / §11).
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Android Min SDK](https://img.shields.io/badge/Min%20SDK-26%20(Android%208.0)-brightgreen)](https://developer.android.com)
+[![Android Target SDK](https://img.shields.io/badge/Target%20SDK-35%20(Android%2015)-green)](https://developer.android.com)
 
 ---
 
-## 🌟 Features (v1)
+## 🔒 Security & Storage Disclosures
 
-- **Direct Telegram Authentication**: Log in with your real Telegram account using your own `api_id` and `api_hash` from `my.telegram.org` (Phone → OTP → conditional 2FA cloud password).
-- **Original Quality (Zero Compression)**: Every photo and video is uploaded as a Telegram Document (never as inline compressed photos/videos) to preserve 100% of original bytes and EXIF metadata.
-- **Serverless Index Sync**: Maintains a compact JSON index (`openphotos_index_v1.json`) stored in your Saved Messages. Reinstalling or setting up a second device reconstructs the full gallery in seconds without re-downloading media files.
-- **Sequential Queue & Flood-Wait Handling**: Paced single-file upload queue that gracefully handles Telegram rate limits (FLOOD_WAIT) with automatic exponential backoff and live countdown banners.
-- **Checksum Duplicate Detection**: Computes SHA-256 hashes locally prior to upload to prevent uploading duplicate files to Saved Messages.
-- **Background Auto-Backup**: Optional WorkManager job that periodically (every 15 min when connected) scans for new camera photos and feeds them into the backup queue.
-- **"Glass-Card-On-Void" Design System**:
-  - Chromeless 3-column thumbnail grid on deep Void `#060709` background.
-  - Tiered Glass system (`RenderEffect` blur on Android 12+ API 31+, translucent fallback on API 26–30).
-  - Animated **Sync Halo** around active uploads, contracting into an Aurora checkmark on completion.
-  - Full-screen viewer with shared-element transitions (`SharedTransitionLayout`).
+> [!IMPORTANT]
+> **On-Device Security & Hardware Encryption:**
+> All sensitive local credentials (`api_id`, `api_hash`, phone number, and TDLib database keys) are encrypted on-device using **AES-256 in GCM mode** via keys generated inside the hardware-backed **Android KeyStore** (`SecureStore`).
+>
+> **Telegram Vault Storage Model:**
+> Media files are stored in a dedicated private broadcast channel (`OpenPhotos Vault` / `vault-marker:openphotos-v1`) under your own Telegram account as raw, full-quality Documents.
+> - **Transport Security:** Transmitted over Telegram's native **MTProto encryption**.
+> - **Storage Model:** Media resides in Telegram's cloud storage. While isolated to your private channel, files are protected by Telegram's server-side storage security and your account's 2FA credentials. *This is not end-to-end zero-knowledge client-side encryption.*
 
 ---
 
-## 🚫 Deferred Scope (What v1 Deliberately Does NOT Do)
+## 🌟 Key Features (V2 Architecture)
 
-Per [`docs/DRD.md`](docs/DRD.md) §5, the following features are intentionally out of scope for v1:
-- **Client-side encryption** (v2 feature).
-- **iOS and Desktop apps** (Android v1 first; Tauri desktop planned for v2).
-- **Social sharing, shared albums, collaborative libraries**.
-- **AI features** (face grouping, auto-tagging, cloud search).
+- **Unified Local & Cloud Gallery Stream:** Displays device photos/videos and Telegram cloud media in a single seamless, chronological grid with visual status badges (`LOCAL_ONLY`, `PENDING_BACKUP`, `UPLOADING`, `BACKED_UP`, `REMOTE_ONLY`).
+- **Automated MediaStore Discovery Scanner:** Automatically scans and indexes device media using lightweight queries (dimensions, durations, dates, file sizes) without loading heavy files or computing hashes upfront.
+- **Real-Time ContentObserver:** Detects newly captured camera roll photos and videos instantly and schedules continuous backups.
+- **Smart Priority Queue (`P0`–`P4`) & Anti-Starvation:**
+  - `P0`: User-selected manual uploads.
+  - `P1`: Newly created camera roll media (uploaded first).
+  - `P2`: Recent existing media (< 30 days).
+  - `P3`: Older existing media (> 30 days).
+  - `P4`: Large videos ($\ge 500\text{ MB}$) or deferred media.
+  - *Anti-Starvation:* Incrementally boosts queued age weights so older media is never starved.
+- **Adaptive Upload Scheduler & MTProto 429 Resilience:** Executes 1 active document upload at a time to prevent rate limits. Automatically catches MTProto `FLOOD_WAIT_X` responses, persists `nextAttemptTimestamp`, and surfaces live countdown banners.
+- **Telegram Vault Index V2 (Snapshots & Deltas):** Replaces monolithic JSON document rewrites with lightweight incremental journal deltas (`openphotos_journal_<seq>.json`) and periodic snapshot compaction (`openphotos_index_v2.json`).
+- **Orphaned Upload Recovery Scanner:** Automatically detects and recovers untracked Telegram document uploads if network writes are interrupted.
+- **Full-Resolution On-Demand Detail Viewer:** Pinch-to-zoom, double-tap zoom (1x $\leftrightarrow$ 2.5x), video playback, real-time download progress, and Scoped Storage MediaStore gallery export.
+- **Independent Storage Management & Free Up Space:**
+  - Three distinct deletion actions: *Delete Device Copy*, *Delete Cloud Copy*, *Delete Everywhere*.
+  - *Free Up Space:* Verifies cloud backups and recovers local disk space without deleting cloud copies.
+  - Storage Dashboard displaying local/cloud counts, thumbnail cache sizes, and recoverable storage metrics.
+- **User Curation & Albums:** Create, rename, delete albums and manage multi-album memberships independently without duplicating media files.
 
 ---
 
-## 🏗️ Architecture & Tech Stack
+## 🏗️ Architecture & System Blueprint
 
-Built following modern Android practices (Clean MVVM, strict 3-layer architecture):
+```mermaid
+graph TD
+    subgraph Presentation Layer [Jetpack Compose & Material 3]
+        Nav[AppNavGraph]
+        Gallery[GalleryScreen & DetailScreen]
+        Upload[UploadScreen & Queue]
+        Settings[SettingsScreen & StorageDashboard]
+    end
 
+    subgraph Domain & Repository Layer
+        TAR[TelegramAuthRepository]
+        VCR[VaultChannelRepository]
+        IR[IndexRepository V2]
+        UR[UploadRepository / AdaptiveUploadScheduler]
+        VR[ViewerRepository]
+        MR[MediaRepository / MediaDiscoveryScanner]
+        SMR[StorageManagementRepository]
+    end
+
+    subgraph Data & Storage Services
+        TC[TelegramClient TDLib Wrapper]
+        SS[SecureStore KeyStore AES-256/GCM]
+        Room[(Room VaultDatabase v4)]
+        WM[AdaptiveBackupWorker WorkManager]
+    end
+
+    subgraph Telegram Infrastructure
+        Vault[Private Broadcast Channel: OpenPhotos Vault]
+        IndexV2[Index Snapshots & Journal Deltas]
+        Docs[Raw Media Documents]
+    end
+
+    Nav --> Gallery & Upload & Settings
+    Gallery & Upload & Settings --> TAR & VCR & IR & UR & VR & MR & SMR
+    TAR & VCR & IR & UR & VR & SMR --> TC
+    SS --> TAR & VCR & IR
+    Room <--> IR & UR & VR & MR & SMR
+    WM --> UR
+
+    TC <==>|MTProto Protocol| Vault
+    Vault --> IndexV2
+    Vault --> Docs
 ```
-UI Layer (Compose, Material 3, Custom Glass Design System)
-       ↕ StateFlow / ViewModel
-ViewModel Layer (Per-screen StateFlow adapters)
-       ↕ Repository interfaces
-Repository Layer (TelegramAuthRepository, UploadRepository, IndexRepository, MediaRepository)
-       ↕ Data sources
-Data Sources (TDLib JNI, Room DB cache, DataStore + Keystore, MediaStore)
-```
-
-- **Layering Rule**: Repositories are the **only** layer allowed to touch TDLib or Room directly. ViewModels and UI composables never touch TDLib or Room.
-- **TDLib Integration**: Official Telegram Client Library (prebuilt JNI AAR via `com.github.tdlibx:td`).
-- **Local Cache**: Room Database (`vault_db`) caches the backed-up items and mirrors the remote Telegram JSON index.
-- **Secure Credentials**: `api_id`, `api_hash`, and TDLib database keys are encrypted using `DataStore` + Android Keystore (AES-256/GCM).
 
 ---
 
-## 📥 Download APK & Build Instructions
+## 📥 Build & Setup Instructions
 
-### Direct APK Download
-You can download the pre-compiled `.apk` file directly without building the source code:
-1. **GitHub Releases**: Download the latest APK asset from the **Releases** page.
-2. **GitHub Actions Artifacts**:
-   - Go to the **Actions** tab in this GitHub repository.
-   - Select the latest **Build and Deploy APK** workflow run.
-   - Scroll down to the **Artifacts** section and download `openphotos-debug-apk`.
-
----
-
-### Prerequisites for Local Building
-- **JDK 17** (or Android Studio Ladybug/JBR 17+).
-- **Android SDK** (API 35 compileSdk, minSdk 26).
-- **Telegram API Credentials**: Obtain an `api_id` and `api_hash` for free at [my.telegram.org](https://my.telegram.org).
+### Prerequisites
+- **Android Studio Ladybug / JDK 17+**
+- **Android SDK:** Compile SDK 35, Min SDK 26 (Android 8.0+)
+- **Telegram API Credentials:** Obtain a free `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org).
 
 ### Build Commands
 
-1. **Clone the repository**:
+1. **Clone the repository:**
    ```bash
    git clone https://github.com/Yadavallitejas/open-photos.git
    cd open-photos
    ```
 
-2. **Compile Debug APK**:
+2. **Build Debug APK:**
    ```bash
-   # Linux / macOS / Windows
-   ./gradlew :app:assembleDebug
+   ./gradlew app:assembleDebug
    ```
 
-3. **Install to Connected Device / Emulator**:
+3. **Run Unit Test Suite:**
    ```bash
-   ./gradlew :app:installDebug
+   ./gradlew testDebugUnitTest
    ```
 
----
-
-## 📁 Repository Structure & Documentation
-
-```
-openphotos/
-├── app/                      # Main Android application module
-│   └── src/main/java/com/qaxlabs/openphotos/
-│       ├── data/             # Repositories, Room DB, WorkManager & TDLib wrapper
-│       ├── ui/               # Compose screens (Auth, Gallery, Viewer, Upload, Settings)
-│       └── OpenPhotosApp.kt  # Application entry point & Hilt WorkerFactory provider
-├── docs/                     # Source-of-truth project documentation
-│   ├── DRD.md                # Detailed Requirements Document
-│   ├── tech_stack.md         # Technology stack & architectural guidelines
-│   ├── design_system.md      # Glass-Card-on-Void visual specs & tokens
-│   └── roadmap.md            # Version roadmap & Index JSON schema
-├── build.gradle.kts          # Root build script
-├── gradle.properties         # JVM heap & build settings (3 GB heap + ParallelGC)
-└── README.md                 # Product overview & setup guide
-```
+4. **Install to Device:**
+   ```bash
+   ./gradlew app:installDebug
+   ```
 
 ---
 
 ## 📄 License
 
-Distributed under the **Apache License 2.0**. See `LICENSE` for details.
+Distributed under the **Apache License 2.0**. See [`LICENSE`](LICENSE) for details.

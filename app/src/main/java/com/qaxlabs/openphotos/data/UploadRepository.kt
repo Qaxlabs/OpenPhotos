@@ -73,8 +73,10 @@ private const val UPLOAD_TIMEOUT_MS = 30L * 60 * 1_000
 class UploadRepository @Inject constructor(
     private val client: TelegramClient,
     private val dao: UploadedItemDao,
+    private val unifiedMediaDao: com.qaxlabs.openphotos.data.db.UnifiedMediaDao,
     private val indexRepository: IndexRepository,
     private val vaultChannelRepository: VaultChannelRepository,
+    private val workScheduler: WorkScheduler,
     @ApplicationContext private val context: Context,
     @ApplicationScope private val scope: CoroutineScope,
 ) {
@@ -121,6 +123,7 @@ class UploadRepository @Inject constructor(
         }
         _queue.update { current -> current + newItems }
         workSignal.trySend(Unit)
+        runCatching { workScheduler.scheduleImmediate() }
     }
 
     /** Clears the queue (e.g. after a completed session or explicit user action). */
@@ -273,6 +276,9 @@ class UploadRepository @Inject constructor(
         val messageContent = successUpdate.message.content as? TdApi.MessageDocument
         val remoteThumbId = messageContent?.document?.thumbnail?.file?.remote?.id ?: ""
 
+        val takenAtMillis = item.mediaItem.dateAdded * 1_000L
+        val nowMillis = System.currentTimeMillis()
+
         // 7. Persist to Room — includes the new indexId, sha256, and thumbnailRemoteId for FR-INDEX.
         dao.insert(
             UploadedItemEntity(
@@ -282,13 +288,41 @@ class UploadRepository @Inject constructor(
                 sizeBytes         = item.mediaItem.sizeBytes,
                 mimeType          = item.mediaItem.mimeType,
                 sha256            = sha256,
-                takenAt           = item.mediaItem.dateAdded * 1_000L,  // seconds → millis
+                takenAt           = takenAtMillis,
                 telegramChatId    = chatId,
                 telegramMessageId = realMessageId,
-                uploadedAt        = System.currentTimeMillis(),
+                uploadedAt        = nowMillis,
                 thumbnailRemoteId = remoteThumbId,
             )
         )
+
+        // Persist to UnifiedMediaDao
+        val isVideo = item.mediaItem.mimeType.startsWith("video/")
+        val mediaEntity = com.qaxlabs.openphotos.data.db.MediaEntity(
+            id = item.id,
+            filename = item.mediaItem.displayName,
+            mimeType = item.mediaItem.mimeType,
+            mediaType = if (isVideo) "VIDEO" else "IMAGE",
+            sizeBytes = item.mediaItem.sizeBytes,
+            createdAt = takenAtMillis,
+            modifiedAt = nowMillis,
+            sha256 = sha256,
+            backupStatus = "BACKED_UP",
+        )
+        val localMeta = com.qaxlabs.openphotos.data.db.LocalMediaMetadataEntity(
+            mediaId = item.id,
+            localUri = item.mediaItem.uri.toString(),
+            devicePath = item.mediaItem.absolutePath,
+            dateAdded = takenAtMillis,
+        )
+        val remoteMeta = com.qaxlabs.openphotos.data.db.RemoteMediaMetadataEntity(
+            mediaId = item.id,
+            telegramChatId = chatId,
+            telegramMessageId = realMessageId,
+            thumbnailRemoteId = remoteThumbId,
+            uploadedAt = nowMillis,
+        )
+        unifiedMediaDao.upsertUnifiedMedia(mediaEntity, localMeta, remoteMeta)
 
         // 9. Push updated index to Saved Messages (FR-INDEX-1).
         //    Runs on the same sequential coroutine — no concurrency risk.
@@ -312,9 +346,10 @@ class UploadRepository @Inject constructor(
      * leave it to the OS cache-eviction policy.
      */
     private fun copyToCache(item: MediaItem): String {
+        val uri = item.uri ?: throw IllegalStateException("Cannot open stream: Uri is null for ${item.displayName}")
         val cacheFile = File(context.cacheDir, "upload_${item.id}_${item.displayName}")
         if (!cacheFile.exists()) {
-            context.contentResolver.openInputStream(item.uri)?.use { input ->
+            context.contentResolver.openInputStream(uri)?.use { input ->
                 FileOutputStream(cacheFile).use { output -> input.copyTo(output) }
             } ?: throw IllegalStateException("Cannot open stream for ${item.displayName}")
         }

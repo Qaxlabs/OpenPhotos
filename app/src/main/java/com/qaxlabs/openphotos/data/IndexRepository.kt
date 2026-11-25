@@ -5,14 +5,16 @@ import android.util.Log
 import com.qaxlabs.openphotos.data.db.UploadedItemDao
 import com.qaxlabs.openphotos.data.db.UploadedItemEntity
 import com.qaxlabs.openphotos.data.di.ApplicationScope
+import com.qaxlabs.openphotos.data.engine.OrphanedUploadReconciler
+import com.qaxlabs.openphotos.data.engine.VaultIndexJournalEngine
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
@@ -24,8 +26,6 @@ import java.time.Instant
 import javax.inject.Inject
 import javax.inject.Singleton
 
-// ── Sync state ────────────────────────────────────────────────────────────────
-
 sealed class SyncState {
     object Idle : SyncState()
     object Syncing : SyncState()
@@ -33,60 +33,31 @@ sealed class SyncState {
     data class Error(val message: String) : SyncState()
 }
 
-// ── IndexRepository ────────────────────────────────────────────────────────────
-
-/**
- * Manages the serverless vault index stored as a JSON Document in the user's
- * dedicated private vault channel (FR-INDEX-0, FR-INDEX-1).
- *
- * ARCHITECTURE CONTRACT (tech_stack.md §3):
- * This is the ONLY class besides [TelegramAuthRepository], [UploadRepository],
- * and [VaultChannelRepository] permitted to call [TelegramClient] directly.
- * No ViewModel touches TDLib.
- *
- * ### "Fixed message" strategy (FR-INDEX-1)
- * The index JSON is written to a Document named [VaultIndex.INDEX_FILENAME].
- *  - First write  → `SendMessage` → message ID cached in [SecureStore].
- *  - Subsequent   → `EditMessageMedia` → same message ID, document replaced.
- *  - After reinstall, [SecureStore] is cleared → [findIndexMessage] scans recent
- *    vault channel history for the file name as a fallback.
- *
- * ### Remote-wins reconciliation (FR-INDEX-4)
- * [syncFromRemote] wipes Room then re-populates from the remote index,
- * giving the Telegram-stored copy unconditional authority.
- */
 @Singleton
 class IndexRepository @Inject constructor(
     private val client: TelegramClient,
     private val dao: UploadedItemDao,
+    private val unifiedMediaDao: com.qaxlabs.openphotos.data.db.UnifiedMediaDao,
     private val secureStore: SecureStore,
     private val vaultChannelRepository: VaultChannelRepository,
+    private val journalEngine: VaultIndexJournalEngine,
+    private val orphanReconciler: OrphanedUploadReconciler,
     @ApplicationContext private val context: Context,
     @ApplicationScope private val scope: CoroutineScope,
 ) {
     companion object {
         private const val TAG = "IndexRepository"
-        private const val PUSH_TIMEOUT_MS = 60_000L
         private const val DOWNLOAD_TIMEOUT_MS = 30_000L
     }
 
     private val _syncState = MutableStateFlow<SyncState>(SyncState.Idle)
     val syncState: StateFlow<SyncState> = _syncState.asStateFlow()
 
-    /** Prevents concurrent push operations from racing. */
     private val pushMutex = Mutex()
-
-    // ── Public API ─────────────────────────────────────────────────────────────
 
     /**
      * Pulls the remote index from the vault channel and reconciles it into Room.
-     *
-     * FR-INDEX-2: Called on every successful login (including on a fresh install
-     * against an account that already has uploads).
-     * FR-INDEX-4: Remote wins — local Room is cleared and repopulated.
-     *
-     * Non-fatal: if the remote index is unavailable (network, first-time account),
-     * the error is surfaced via [syncState] but the app continues normally.
+     * Supports V1 to V2 safe migration and orphan reconciliation.
      */
     suspend fun syncFromRemote() {
         _syncState.value = SyncState.Syncing
@@ -96,19 +67,60 @@ class IndexRepository @Inject constructor(
 
             if (indexMessage != null) {
                 val jsonText = downloadDocumentText(indexMessage)
+
                 val index = Json.decodeFromString<VaultIndex>(jsonText)
 
-                // FR-INDEX-4: remote wins — clear local, insert all remote items
                 dao.clearAll()
-                dao.insertAll(index.files.map { entry -> entry.toEntity(chatId) })
+                unifiedMediaDao.clearAll()
 
-                // Re-cache the message ID (covers the post-reinstall recovery path)
+                val legacyEntities = index.files.map { entry -> entry.toEntity(chatId) }
+                dao.insertAll(legacyEntities)
+
+                for (entry in index.files) {
+                    val entity = entry.toEntity(chatId)
+                    val isVideo = entity.mimeType.startsWith("video/")
+                    val mediaEntity = com.qaxlabs.openphotos.data.db.MediaEntity(
+                        id = entity.indexId,
+                        filename = entity.displayName,
+                        mimeType = entity.mimeType,
+                        mediaType = if (isVideo) "VIDEO" else "IMAGE",
+                        sizeBytes = entity.sizeBytes,
+                        createdAt = entity.takenAt,
+                        modifiedAt = entity.uploadedAt,
+                        sha256 = entity.sha256,
+                        backupStatus = "REMOTE_ONLY",
+                    )
+                    val remoteMeta = com.qaxlabs.openphotos.data.db.RemoteMediaMetadataEntity(
+                        mediaId = entity.indexId,
+                        telegramChatId = entity.telegramChatId,
+                        telegramMessageId = entity.telegramMessageId,
+                        thumbnailRemoteId = entity.thumbnailRemoteId,
+                        uploadedAt = entity.uploadedAt,
+                    )
+                    val localMeta = if (entity.localUri.isNotBlank()) {
+                        com.qaxlabs.openphotos.data.db.LocalMediaMetadataEntity(
+                            mediaId = entity.indexId,
+                            localUri = entity.localUri,
+                            devicePath = null,
+                            dateAdded = entity.takenAt,
+                        )
+                    } else null
+
+                    unifiedMediaDao.upsertUnifiedMedia(mediaEntity, localMeta, remoteMeta)
+                }
+
+                // Run orphan reconciler to discover untracked uploads
+                val orphansCount = orphanReconciler.reconcileOrphanedUploads()
+                if (orphansCount > 0) {
+                    Log.i(TAG, "Reconciled $orphansCount orphaned uploads from Telegram channel.")
+                }
+
                 secureStore.setIndexMessageId(indexMessage.id)
 
-                Log.i(TAG, "Synced ${index.files.size} items from remote index")
-                _syncState.value = SyncState.Done(index.files.size)
+                val totalCount = index.files.size + orphansCount
+                Log.i(TAG, "Synced $totalCount items from remote index (including $orphansCount orphans)")
+                _syncState.value = SyncState.Done(totalCount)
             } else {
-                // No index found: fresh account or user manually deleted it
                 Log.i(TAG, "No remote index found — fresh account")
                 _syncState.value = SyncState.Done(0)
             }
@@ -119,111 +131,47 @@ class IndexRepository @Inject constructor(
     }
 
     /**
-     * Builds the full index from Room and writes/edits it in the vault channel.
-     *
-     * FR-INDEX-1: Called after every successful upload or deletion.
-     * Serialised via [pushMutex] so concurrent calls (e.g. rapid uploads) don't
-     * race — only the last caller's snapshot wins.
-     *
-     * Non-fatal: push failures are logged but do not fail the upload itself.
+     * Builds full V2 snapshot or journal delta from Room and writes it to Telegram.
      */
     suspend fun pushIndex() {
         pushMutex.withLock {
             try {
                 val chatId = vaultChannelRepository.getOrCreateVaultChannel()
+                val relations = unifiedMediaDao.getUnifiedMediaPaged(limit = 10_000, offset = 0)
 
-                // Build the JSON from the current Room contents
-                val entities = dao.getAllOnce()
-                val index = VaultIndex(
-                    files = entities.map { entity -> entity.toIndexEntry() },
-                )
-                val jsonText = Json.encodeToString(index)
-
-                // Write to a temp file that TDLib can upload
-                val tmpFile = File(context.cacheDir, VaultIndex.INDEX_FILENAME)
-                tmpFile.writeText(jsonText)
-
-                val inputDoc = TdApi.InputMessageDocument(
-                    TdApi.InputFileLocal(tmpFile.absolutePath),
-                    null,
-                    true,   // disableContentTypeDetection — keep as Document
-                    TdApi.FormattedText(VaultIndex.INDEX_CAPTION, emptyArray()),
-                )
-
-                val cachedMsgId = secureStore.getIndexMessageId()
-                if (cachedMsgId != null) {
-                    editIndexMessage(chatId, cachedMsgId, inputDoc)
+                if (journalEngine.shouldCompacting() || secureStore.getIndexMessageId() == null) {
+                    journalEngine.createAndPushSnapshot(relations)
                 } else {
-                    sendIndexMessage(chatId, inputDoc)
+                    val entries = relations.map { rel ->
+                        VaultIndexEntryV2(
+                            id = rel.media.id,
+                            messageId = rel.remoteMetadata?.telegramMessageId ?: 0L,
+                            filename = rel.media.filename,
+                            sizeBytes = rel.media.sizeBytes,
+                            checksum = rel.media.sha256,
+                            takenAt = Instant.ofEpochMilli(rel.media.createdAt).toString(),
+                            uploadedAt = Instant.ofEpochMilli(rel.remoteMetadata?.uploadedAt ?: rel.media.modifiedAt).toString(),
+                            mimeType = rel.media.mimeType,
+                            localUri = rel.localMetadata?.localUri ?: "",
+                            chatId = rel.remoteMetadata?.telegramChatId ?: chatId,
+                            thumbnailRemoteId = rel.remoteMetadata?.thumbnailRemoteId,
+                            favorite = rel.media.favorite,
+                            trashState = rel.media.trashState,
+                            albums = emptyList(),
+                            width = rel.media.width,
+                            height = rel.media.height,
+                            durationMs = rel.media.durationMs,
+                        )
+                    }
+                    journalEngine.appendDelta(added = entries)
                 }
             } catch (e: Exception) {
-                // Index push failure is non-fatal: the upload already succeeded
-                // and Room is already updated. The index will be consistent on
-                // the next push or after a manual sync.
                 Log.e(TAG, "pushIndex failed (non-fatal)", e)
             }
         }
     }
 
-    // ── Private — Telegram operations ─────────────────────────────────────────
-
-    /**
-     * Edits the existing index message in-place.
-     * If the edit fails (e.g. the message was manually deleted by the user),
-     * falls back to sending a fresh message.
-     */
-    private suspend fun editIndexMessage(
-        chatId: Long,
-        messageId: Long,
-        inputDoc: TdApi.InputMessageDocument,
-    ) {
-        try {
-            val editReq = TdApi.EditMessageMedia().also { m ->
-                m.chatId               = chatId
-                m.messageId            = messageId
-                m.inputMessageContent  = inputDoc
-            }
-            client.send(editReq)   // throws TelegramException on failure
-            Log.d(TAG, "Edited index message $messageId")
-        } catch (e: TelegramException) {
-            // Message gone — clear the cached ID and send a new one
-            Log.w(TAG, "Edit failed (${e.message}); sending new index message")
-            secureStore.clearIndexMessageId()
-            sendIndexMessage(chatId, inputDoc)
-        }
-    }
-
-    /**
-     * Sends a new index Document message and caches its permanent message ID.
-     */
-    private suspend fun sendIndexMessage(chatId: Long, inputDoc: TdApi.InputMessageDocument) {
-        val sendReq = TdApi.SendMessage().also { m ->
-            m.chatId              = chatId
-            m.inputMessageContent = inputDoc
-        }
-        val tempMessage = client.send(sendReq) as TdApi.Message
-
-        // Wait for the send to be acknowledged so we get the permanent message ID
-        val success = withTimeout(PUSH_TIMEOUT_MS) {
-            client.updates
-                .filterIsInstance<TdApi.UpdateMessageSendSucceeded>()
-                .first { it.oldMessageId == tempMessage.id }
-        }
-        val permanentId = success.message.id
-        secureStore.setIndexMessageId(permanentId)
-        Log.i(TAG, "Sent new index message, permanent ID = $permanentId")
-    }
-
-    /**
-     * Finds the index Document message in the vault channel.
-     *
-     * Strategy (ordered by cost):
-     * 1. Use cached message ID from [SecureStore] (O(1), no network).
-     * 2. Scan up to 200 recent messages in the vault channel for the index file name.
-     * 3. Return null if not found (first install / user manually deleted it).
-     */
     private suspend fun findIndexMessage(chatId: Long): TdApi.Message? {
-        // 1. Try cached ID first
         val cachedId = secureStore.getIndexMessageId()
         if (cachedId != null) {
             val message = runCatching {
@@ -232,20 +180,13 @@ class IndexRepository @Inject constructor(
             if (message != null && message.content is TdApi.MessageDocument) {
                 return message
             }
-            // Message gone — clear stale cache and fall through to scan
             secureStore.clearIndexMessageId()
         }
-
-        // 2. Scan recent history for the index file
         return scanHistoryForIndex(chatId)
     }
 
-    /**
-     * Walks backward through vault channel history looking for the index Document.
-     * Scans at most 200 messages (2 × 100-message pages) before giving up.
-     */
     private suspend fun scanHistoryForIndex(chatId: Long): TdApi.Message? {
-        var fromMessageId = 0L  // 0 = start from the newest message
+        var fromMessageId = 0L
         repeat(2) {
             val historyResult = runCatching {
                 val req = TdApi.GetChatHistory().also { r ->
@@ -261,7 +202,8 @@ class IndexRepository @Inject constructor(
             for (msg in historyResult.messages) {
                 val content = msg.content
                 if (content is TdApi.MessageDocument &&
-                    content.document.fileName == VaultIndex.INDEX_FILENAME) {
+                    (content.document.fileName == VaultIndex.INDEX_FILENAME ||
+                     content.document.fileName == VaultIndexV2Spec.V2_INDEX_FILENAME)) {
                     Log.i(TAG, "Found index message via scan: ${msg.id}")
                     return msg
                 }
@@ -273,26 +215,16 @@ class IndexRepository @Inject constructor(
         return null
     }
 
-    /**
-     * Downloads the text content of a Document message.
-     *
-     * Uses TDLib's synchronous [TdApi.DownloadFile] (priority 32) which blocks
-     * the coroutine until the file is fully written to local storage, then reads
-     * the file off disk.
-     */
     private suspend fun downloadDocumentText(message: TdApi.Message): String {
         val doc  = (message.content as TdApi.MessageDocument).document
         val file = doc.document
 
-        // If TDLib already has it cached, read immediately
         if (file.local.isDownloadingCompleted && file.local.path.isNotEmpty()) {
             return File(file.local.path).readText()
         }
 
-        // Start download (non-blocking request)
         client.send(TdApi.DownloadFile(file.id, 32, 0, 0, false))
 
-        // Wait for completion via UpdateFile
         val completed = withTimeout(DOWNLOAD_TIMEOUT_MS) {
             client.updates
                 .filterIsInstance<TdApi.UpdateFile>()
@@ -301,10 +233,22 @@ class IndexRepository @Inject constructor(
         }
         return File(completed.file.local.path).readText()
     }
-
 }
 
-// ── Conversion extension functions ────────────────────────────────────────────
+/** Converts a JSON index entry back into a Room entity during [IndexRepository.syncFromRemote]. */
+fun VaultIndexEntry.toEntity(chatId: Long): UploadedItemEntity = UploadedItemEntity(
+    indexId           = id,
+    localUri          = localUri,
+    displayName       = filename,
+    sizeBytes         = sizeBytes,
+    mimeType          = mimeType,
+    sha256            = checksum,
+    takenAt           = runCatching { Instant.parse(takenAt).toEpochMilli() }.getOrDefault(0L),
+    telegramChatId    = if (this.chatId != 0L) this.chatId else chatId,
+    telegramMessageId = messageId,
+    uploadedAt        = runCatching { Instant.parse(uploadedAt).toEpochMilli() }.getOrDefault(0L),
+    thumbnailRemoteId = thumbnailRemoteId,
+)
 
 /** Converts a Room entity to a JSON index entry for [IndexRepository.pushIndex]. */
 fun UploadedItemEntity.toIndexEntry(): VaultIndexEntry = VaultIndexEntry(
@@ -318,25 +262,5 @@ fun UploadedItemEntity.toIndexEntry(): VaultIndexEntry = VaultIndexEntry(
     mimeType          = mimeType,
     localUri          = localUri,
     chatId            = telegramChatId,
-    thumbnailRemoteId = thumbnailRemoteId,
-)
-
-/**
- * Converts a JSON index entry back into a Room entity during [IndexRepository.syncFromRemote].
- *
- * [chatId] is the resolved Saved Messages chat ID for this session. Room entries
- * restored from the remote index have the same chat ID as when they were uploaded.
- */
-fun VaultIndexEntry.toEntity(chatId: Long): UploadedItemEntity = UploadedItemEntity(
-    indexId           = id,
-    localUri          = localUri,
-    displayName       = filename,
-    sizeBytes         = sizeBytes,
-    mimeType          = mimeType,
-    sha256            = checksum,
-    takenAt           = runCatching { Instant.parse(takenAt).toEpochMilli() }.getOrDefault(0L),
-    telegramChatId    = if (this.chatId != 0L) this.chatId else chatId,
-    telegramMessageId = messageId,
-    uploadedAt        = runCatching { Instant.parse(uploadedAt).toEpochMilli() }.getOrDefault(0L),
     thumbnailRemoteId = thumbnailRemoteId,
 )

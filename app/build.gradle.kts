@@ -107,6 +107,10 @@ dependencies {
     implementation("androidx.hilt:hilt-work:1.2.0")
     ksp("androidx.hilt:hilt-compiler:1.2.0")
 
+    // ── Media3 ExoPlayer (In-app Video Playback) ─────────────────────────────
+    implementation("androidx.media3:media3-exoplayer:1.5.1")
+    implementation("androidx.media3:media3-ui:1.5.1")
+
     // ── Coil 3 (MediaStore thumbnail loading) ─────────────────────────────────
     implementation("io.coil-kt.coil3:coil-compose:3.2.0")
     implementation("io.coil-kt.coil3:coil-video:3.2.0")

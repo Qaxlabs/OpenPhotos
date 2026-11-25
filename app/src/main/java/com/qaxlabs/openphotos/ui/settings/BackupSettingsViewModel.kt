@@ -24,24 +24,54 @@ class BackupSettingsViewModel @Inject constructor(
     private val workScheduler: WorkScheduler,
 ) : ViewModel() {
 
-    /**
-     * Reactive auto-backup enabled state.
-     * Collected by [SettingsScreen] to keep the Switch in sync with DataStore.
-     */
     val autoBackupEnabled: StateFlow<Boolean> =
         backupPreferences.autoBackupEnabledFlow
             .stateIn(
                 scope = viewModelScope,
                 started = SharingStarted.WhileSubscribed(5_000),
-                initialValue = false,
+                initialValue = true,
             )
 
-    /**
-     * Toggles the auto-backup feature and schedules / cancels the
-     * WorkManager periodic job accordingly.
-     *
-     * Called from the Settings Switch's onCheckedChange callback.
-     */
+    val photosEnabled: StateFlow<Boolean> =
+        backupPreferences.photosBackupEnabledFlow
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5_000),
+                initialValue = true,
+            )
+
+    val videosEnabled: StateFlow<Boolean> =
+        backupPreferences.videosBackupEnabledFlow
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5_000),
+                initialValue = true,
+            )
+
+    val wifiOnly: StateFlow<Boolean> =
+        backupPreferences.wifiOnlyFlow
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5_000),
+                initialValue = true,
+            )
+
+    val batteryAware: StateFlow<Boolean> =
+        backupPreferences.batteryAwareFlow
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5_000),
+                initialValue = true,
+            )
+
+    val largeVideoThresholdMb: StateFlow<Int> =
+        backupPreferences.largeVideoThresholdMbFlow
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5_000),
+                initialValue = 500,
+            )
+
     fun setAutoBackupEnabled(enabled: Boolean) {
         viewModelScope.launch {
             backupPreferences.setAutoBackupEnabled(enabled)
@@ -50,6 +80,36 @@ class BackupSettingsViewModel @Inject constructor(
             } else {
                 workScheduler.cancel()
             }
+        }
+    }
+
+    fun setPhotosEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            backupPreferences.setPhotosBackupEnabled(enabled)
+        }
+    }
+
+    fun setVideosEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            backupPreferences.setVideosBackupEnabled(enabled)
+        }
+    }
+
+    fun setWifiOnly(wifiOnly: Boolean) {
+        viewModelScope.launch {
+            backupPreferences.setWifiOnly(wifiOnly)
+        }
+    }
+
+    fun setBatteryAware(batteryAware: Boolean) {
+        viewModelScope.launch {
+            backupPreferences.setBatteryAware(batteryAware)
+        }
+    }
+
+    fun setLargeVideoThresholdMb(thresholdMb: Int) {
+        viewModelScope.launch {
+            backupPreferences.setLargeVideoThresholdMb(thresholdMb)
         }
     }
 }

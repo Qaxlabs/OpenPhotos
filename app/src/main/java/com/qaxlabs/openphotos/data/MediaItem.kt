@@ -15,14 +15,14 @@ import android.net.Uri
  */
 data class MediaItem(
     val id: Long,
-    val uri: Uri,
+    val uri: Uri? = null,
     val displayName: String,
     val sizeBytes: Long,
     val mimeType: String,
     /** Epoch seconds — used for "newest first" sort. */
     val dateAdded: Long,
     /** Absolute file-system path; may be null on some storage providers. */
-    val absolutePath: String?,
+    val absolutePath: String? = null,
 ) {
     val isVideo: Boolean get() = mimeType.startsWith("video/")
     val isImage: Boolean get() = mimeType.startsWith("image/")

@@ -26,11 +26,31 @@ import javax.inject.Singleton
  * The OS may defer this further under Doze; this is acceptable per the
  * plan (goal is "queued without opening the app", not "queued within 15 min").
  */
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
+import com.qaxlabs.openphotos.data.engine.AdaptiveBackupWorker
+
 @Singleton
 class WorkScheduler @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
     private val workManager get() = WorkManager.getInstance(context)
+
+    fun scheduleImmediate() {
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+
+        val request = OneTimeWorkRequestBuilder<AdaptiveBackupWorker>()
+            .setConstraints(constraints)
+            .build()
+
+        workManager.enqueueUniqueWork(
+            AdaptiveBackupWorker.WORK_NAME,
+            ExistingWorkPolicy.REPLACE,
+            request,
+        )
+    }
 
     fun schedule() {
         val constraints = Constraints.Builder()
@@ -53,5 +73,6 @@ class WorkScheduler @Inject constructor(
 
     fun cancel() {
         workManager.cancelUniqueWork(MediaWatcherWorker.WORK_NAME)
+        workManager.cancelUniqueWork(AdaptiveBackupWorker.WORK_NAME)
     }
 }

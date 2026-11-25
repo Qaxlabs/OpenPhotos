@@ -53,17 +53,17 @@ object ThumbnailGenerator {
     }
 
     private fun generateImageThumbnail(context: Context, item: MediaItem): Bitmap? {
-        val uri = item.uri
         val path = item.absolutePath
+        val uri = item.uri
 
         val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         if (path != null && File(path).exists()) {
             BitmapFactory.decodeFile(path, options)
-        } else {
+        } else if (uri != null) {
             context.contentResolver.openInputStream(uri)?.use {
                 BitmapFactory.decodeStream(it, null, options)
             }
-        }
+        } else return null
 
         val origWidth = options.outWidth
         val origHeight = options.outHeight
@@ -77,18 +77,19 @@ object ThumbnailGenerator {
         val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
         val scaledBitmap = if (path != null && File(path).exists()) {
             BitmapFactory.decodeFile(path, decodeOptions)
-        } else {
+        } else if (uri != null) {
             context.contentResolver.openInputStream(uri)?.use {
                 BitmapFactory.decodeStream(it, null, decodeOptions)
             }
-        } ?: return null
+        } else null
 
+        if (scaledBitmap == null) return null
         return scaleBitmapToMax(scaledBitmap, MAX_THUMB_SIZE)
     }
 
     private fun generateVideoThumbnail(context: Context, item: MediaItem): Bitmap? {
         val path = item.absolutePath
-        val uri = item.uri
+        val uri = item.uri ?: return null
 
         val bitmap: Bitmap? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             try {

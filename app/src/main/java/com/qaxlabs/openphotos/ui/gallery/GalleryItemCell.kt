@@ -44,6 +44,7 @@ fun GalleryItemCell(
     isVideo: Boolean,
     isUploading: Boolean,
     isBackedUp: Boolean,
+    backupStatus: com.qaxlabs.openphotos.data.BackupStatus? = null,
     onClick: () -> Unit,
     sharedTransitionScope: SharedTransitionScope? = null,
     animatedVisibilityScope: AnimatedVisibilityScope? = null,
@@ -134,6 +135,7 @@ fun GalleryItemCell(
         SyncHalo(
             isUploading = isUploading,
             isBackedUp = isBackedUp,
+            backupStatus = backupStatus,
         )
     }
 }

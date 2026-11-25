@@ -1,7 +1,7 @@
 package com.qaxlabs.openphotos.ui.gallery
 
-import android.content.Intent
 import android.net.Uri
+import kotlin.OptIn
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.ExperimentalSharedTransitionApi
@@ -37,9 +37,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.core.content.FileProvider
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.media3.common.MediaItem as Media3MediaItem
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
 import coil3.compose.AsyncImage
 import coil3.compose.AsyncImagePainter
 import coil3.request.ImageRequest
@@ -65,10 +69,10 @@ private const val MIN_ZOOM = 1f
  *
  * - Pure black background.
  * - Swipeable HorizontalPager.
- * - Full-resolution fetch on page settle (FR-GALLERY-3).
- * - Pinch-to-zoom + double-tap-to-zoom on images (FR-GALLERY-4).
- * - Explicit Download action -> MediaStore save (FR-GALLERY-5).
- * - Video: download-then-play via external intent (v1 limitation).
+ * - Full-resolution fetch on page settle.
+ * - Pinch-to-zoom + double-tap-to-zoom on images.
+ * - In-app video playback via Media3 ExoPlayer.
+ * - Explicit Download action -> MediaStore save.
  * - Glass control bars top and bottom, fade on tap.
  */
 @OptIn(ExperimentalSharedTransitionApi::class)
@@ -84,9 +88,6 @@ fun GalleryDetailScreen(
     val viewerStateMap by vm.viewerStateMap.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-
-    // Snackbar host
     val snackbarHostState = remember { SnackbarHostState() }
 
     // Consume download results
@@ -101,11 +102,11 @@ fun GalleryDetailScreen(
         }
     }
 
-    val initialPage = remember(items, initialIndexId) {
-        items.indexOfFirst { it.indexId == initialIndexId }.coerceAtLeast(0)
+    val targetPage = remember(items, initialIndexId) {
+        items.indexOfFirst { it.indexId == initialIndexId }
     }
 
-    if (items.isEmpty()) {
+    if (items.isEmpty() || targetPage < 0) {
         Box(
             Modifier
                 .fillMaxSize()
@@ -117,7 +118,7 @@ fun GalleryDetailScreen(
         return
     }
 
-    val pagerState = rememberPagerState(initialPage = initialPage) { items.size }
+    val pagerState = rememberPagerState(initialPage = targetPage) { items.size }
     val currentItem = items.getOrNull(pagerState.currentPage)
     var controlsVisible by remember { mutableStateOf(true) }
 
@@ -131,15 +132,6 @@ fun GalleryDetailScreen(
 
     // Fetch full-res when pager settles on a new page
     LaunchedEffect(pagerState.currentPage) {
-        if (!pagerState.isScrollInProgress) {
-            items.getOrNull(pagerState.currentPage)?.let { item ->
-                if (item.entity != null) {
-                    vm.fetchFullResolution(item.indexId)
-                }
-            }
-        }
-    }
-    LaunchedEffect(pagerState.isScrollInProgress) {
         if (!pagerState.isScrollInProgress) {
             items.getOrNull(pagerState.currentPage)?.let { item ->
                 if (item.entity != null) {
@@ -180,20 +172,7 @@ fun GalleryDetailScreen(
                     VideoPage(
                         item = item,
                         fileState = fileState,
-                        onPlayRequested = { localPath ->
-                            // Launch external video player
-                            val file = File(localPath)
-                            val uri = FileProvider.getUriForFile(
-                                context,
-                                "${context.packageName}.fileprovider",
-                                file,
-                            )
-                            val intent = Intent(Intent.ACTION_VIEW).apply {
-                                setDataAndType(uri, item.mimeType)
-                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            }
-                            runCatching { context.startActivity(intent) }
-                        },
+                        onFetchRequested = { vm.fetchFullResolution(item.indexId) },
                     )
                 } else {
                     ImagePage(
@@ -302,12 +281,11 @@ private fun ImagePage(
     animatedVisibilityScope: AnimatedVisibilityScope?,
     onTap: () -> Unit,
 ) {
-    var scale by remember { mutableFloatStateOf(1f) }
-    var offset by remember { mutableStateOf(Offset.Zero) }
-    var imageState by remember { mutableStateOf<AsyncImagePainter.State>(AsyncImagePainter.State.Empty) }
+    var scale by remember(item.indexId) { mutableFloatStateOf(1f) }
+    var offset by remember(item.indexId) { mutableStateOf(Offset.Zero) }
+    var imageState by remember(item.indexId) { mutableStateOf<AsyncImagePainter.State>(AsyncImagePainter.State.Empty) }
 
-    // Resolve the best image source available
-    val imageSource = remember(fileState, item.thumbnailPath, item.localUri) {
+    val imageSource = remember(item.indexId, fileState, item.thumbnailPath, item.localUri) {
         when {
             fileState is ViewerFileState.Ready -> File(fileState.localPath)
             item.localUri.startsWith("file://") -> {
@@ -333,20 +311,17 @@ private fun ImagePage(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .pointerInput(Unit) {
-                // Pinch-to-zoom + pan + double-tap
+            .pointerInput(item.indexId) {
                 var lastDoubleTapTime = 0L
                 awaitEachGesture {
                     val firstDown = awaitFirstDown(requireUnconsumed = false)
                     var pointersDown = 1
 
-                    // Detect double tap for zoom toggle
                     val now = System.currentTimeMillis()
                     val isDoubleTap = (now - lastDoubleTapTime) < 300L
                     lastDoubleTapTime = now
 
                     if (isDoubleTap) {
-                        // Toggle between 1x and 2.5x
                         scale = if (scale > 1.5f) 1f else 2.5f
                         offset = Offset.Zero
                         firstDown.consume()
@@ -358,7 +333,6 @@ private fun ImagePage(
                         pointersDown = event.changes.count { it.pressed }
 
                         if (pointersDown >= 2) {
-                            // Pinch gesture
                             val zoomFactor = event.calculateZoom()
                             val pan = event.calculatePan()
 
@@ -375,7 +349,6 @@ private fun ImagePage(
                             }
                             event.changes.forEach { it.consume() }
                         } else if (pointersDown == 1 && scale > 1f) {
-                            // Pan when zoomed in
                             val pan = event.calculatePan()
                             offset = Offset(
                                 x = offset.x + pan.x,
@@ -386,7 +359,6 @@ private fun ImagePage(
                     } while (pointersDown > 0 &&
                         event.changes.any { it.pressed })
 
-                    // Snap back if under minimum zoom
                     if (scale < MIN_ZOOM + 0.05f) {
                         scale = MIN_ZOOM
                         offset = Offset.Zero
@@ -414,7 +386,6 @@ private fun ImagePage(
             onState = { imageState = it },
         )
 
-        // Error placeholder
         if (imageState is AsyncImagePainter.State.Error) {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -434,7 +405,6 @@ private fun ImagePage(
             }
         }
 
-        // Loading shimmer while full-res is still fetching
         if (fileState is ViewerFileState.Loading && imageState !is AsyncImagePainter.State.Error) {
             Box(
                 modifier = Modifier
@@ -451,23 +421,70 @@ private fun ImagePage(
     }
 }
 
-// ── Video page: shows thumbnail + Play button, tapping fetches & opens player ──
+// ── In-App Video Player using Media3 ExoPlayer ─────────────────────────────
+
+@OptIn(UnstableApi::class)
+@Composable
+private fun VideoPlayerView(
+    videoUri: Uri,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val exoPlayer = remember(videoUri) {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(Media3MediaItem.fromUri(videoUri))
+            prepare()
+            playWhenReady = true
+        }
+    }
+
+    DisposableEffect(exoPlayer) {
+        onDispose {
+            exoPlayer.release()
+        }
+    }
+
+    AndroidView(
+        factory = { ctx ->
+            PlayerView(ctx).apply {
+                player = exoPlayer
+                useController = true
+            }
+        },
+        modifier = modifier,
+    )
+}
+
+// ── Video page with In-App Media3 Playback & Cloud Download ───────────────
 
 @Composable
 private fun VideoPage(
     item: VaultGalleryItem,
     fileState: ViewerFileState,
-    onPlayRequested: (localPath: String) -> Unit,
+    onFetchRequested: () -> Unit,
 ) {
-    var imageState by remember { mutableStateOf<AsyncImagePainter.State>(AsyncImagePainter.State.Empty) }
+    var isPlayingInApp by remember(item.indexId) { mutableStateOf(false) }
 
-    val thumbnailSource = remember(item.thumbnailPath, item.localUri) {
+    val localVideoUri = remember(item.localUri) {
         when {
-            !item.thumbnailPath.isNullOrEmpty() -> File(item.thumbnailPath)
-            item.localUri.startsWith("file://") -> File(item.localUri.removePrefix("file://"))
-            else -> Uri.parse(item.localUri)
+            item.localUri.startsWith("content://") -> Uri.parse(item.localUri)
+            item.localUri.startsWith("file://") -> {
+                val f = File(item.localUri.removePrefix("file://"))
+                if (f.exists() && f.length() > 0) Uri.fromFile(f) else null
+            }
+            item.localUri.isNotBlank() && File(item.localUri).exists() -> Uri.fromFile(File(item.localUri))
+            else -> null
         }
     }
+
+    val readyVideoUri = remember(fileState) {
+        if (fileState is ViewerFileState.Ready) {
+            val f = File(fileState.localPath)
+            if (f.exists() && f.length() > 0) Uri.fromFile(f) else null
+        } else null
+    }
+
+    val playUri = readyVideoUri ?: localVideoUri
 
     Box(
         modifier = Modifier
@@ -475,78 +492,111 @@ private fun VideoPage(
             .background(Color.Black),
         contentAlignment = Alignment.Center,
     ) {
-        // Blurred thumbnail as background
-        AsyncImage(
-            model = ImageRequest.Builder(LocalContext.current)
-                .data(thumbnailSource)
-                .crossfade(true)
-                .build(),
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer { alpha = 0.4f },
-            onState = { imageState = it },
-        )
+        if (isPlayingInApp && playUri != null) {
+            VideoPlayerView(
+                videoUri = playUri,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            val thumbnailSource = remember(item.thumbnailPath, item.localUri) {
+                when {
+                    !item.thumbnailPath.isNullOrEmpty() -> File(item.thumbnailPath)
+                    item.localUri.startsWith("file://") -> File(item.localUri.removePrefix("file://"))
+                    else -> Uri.parse(item.localUri)
+                }
+            }
 
-        when (fileState) {
-            is ViewerFileState.Loading -> {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
-                ) {
-                    CircularProgressIndicator(
-                        color = Signal,
-                        modifier = Modifier.size(56.dp),
-                    )
-                    if (fileState.progress > 0f) {
-                        Text(
-                            text = "${(fileState.progress * 100).toInt()}%",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Color.White,
+            AsyncImage(
+                model = ImageRequest.Builder(LocalContext.current)
+                    .data(thumbnailSource)
+                    .crossfade(true)
+                    .build(),
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { alpha = 0.6f },
+            )
+
+            when {
+                fileState is ViewerFileState.Loading -> {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                    ) {
+                        CircularProgressIndicator(
+                            color = Signal,
+                            modifier = Modifier.size(56.dp),
+                        )
+                        if (fileState.progress > 0f) {
+                            Text(
+                                text = "Downloading video... ${(fileState.progress * 100).toInt()}%",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color.White,
+                            )
+                        }
+                    }
+                }
+                playUri != null -> {
+                    IconButton(
+                        onClick = { isPlayingInApp = true },
+                        modifier = Modifier.size(80.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.PlayArrow,
+                            contentDescription = "Play video",
+                            tint = Color.White,
+                            modifier = Modifier.size(80.dp),
                         )
                     }
                 }
-            }
-            is ViewerFileState.Ready -> {
-                IconButton(
-                    onClick = { onPlayRequested(fileState.localPath) },
-                    modifier = Modifier.size(80.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.PlayArrow,
-                        contentDescription = "Play video",
-                        tint = Color.White,
-                        modifier = Modifier.size(80.dp),
-                    )
+                fileState is ViewerFileState.Error -> {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.ImageNotSupported,
+                            contentDescription = null,
+                            tint = Mist,
+                            modifier = Modifier.size(56.dp),
+                        )
+                        Text(
+                            text = fileState.message,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Mist,
+                        )
+                        Button(
+                            onClick = onFetchRequested,
+                            colors = ButtonDefaults.buttonColors(containerColor = Signal, contentColor = Color.White),
+                        ) {
+                            Text("Retry Download")
+                        }
+                    }
                 }
-            }
-            is ViewerFileState.Error -> {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.ImageNotSupported,
-                        contentDescription = null,
-                        tint = Mist,
-                        modifier = Modifier.size(56.dp),
-                    )
-                    Text(
-                        text = fileState.message,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Mist,
-                    )
+                else -> {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        IconButton(
+                            onClick = onFetchRequested,
+                            modifier = Modifier.size(80.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.PlayArrow,
+                                contentDescription = "Download & Play Video",
+                                tint = Color.White,
+                                modifier = Modifier.size(80.dp),
+                            )
+                        }
+                        Text(
+                            text = "Tap to download & play cloud video",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = Color.White.copy(alpha = 0.8f),
+                        )
+                    }
                 }
-            }
-            else -> {
-                // Idle: show a static play icon as placeholder
-                Icon(
-                    imageVector = Icons.Filled.PlayArrow,
-                    contentDescription = "Video",
-                    tint = Color.White.copy(alpha = 0.6f),
-                    modifier = Modifier.size(72.dp),
-                )
             }
         }
     }
@@ -572,6 +622,15 @@ private fun DetailBottomBar(
                 dateFormatter.format(Instant.ofEpochMilli(millis))
             }.getOrDefault("—")
         } else "—"
+    }
+
+    val statusBadgeText = remember(item.isBackedUp, item.localUri) {
+        val isLocalFileExisting = item.localUri.isNotBlank() && (item.localUri.startsWith("content://") || File(item.localUri.removePrefix("file://")).exists())
+        when {
+            item.isBackedUp && isLocalFileExisting -> "Backed Up • Local + Cloud"
+            item.isBackedUp -> "Cloud Only"
+            else -> "Local Only"
+        }
     }
 
     val canDownload = viewerState is ViewerFileState.Ready && item.entity != null
@@ -603,9 +662,13 @@ private fun DetailBottomBar(
                     style = DataTextStyle,
                     color = Mist,
                 )
+                Text(
+                    text = statusBadgeText,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Signal,
+                )
             }
 
-            // Download button — only enabled when full-res is ready
             IconButton(
                 onClick = onDownload,
                 enabled = canDownload,

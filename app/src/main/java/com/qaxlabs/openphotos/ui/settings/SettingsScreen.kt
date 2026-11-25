@@ -145,7 +145,12 @@ fun SettingsScreen(
             }
 
             // Auto-backup section
-            SettingsSection(title = "Auto-Backup") {
+            val photosEnabled by backupVm.photosEnabled.collectAsStateWithLifecycle()
+            val videosEnabled by backupVm.videosEnabled.collectAsStateWithLifecycle()
+            val wifiOnly by backupVm.wifiOnly.collectAsStateWithLifecycle()
+            val batteryAware by backupVm.batteryAware.collectAsStateWithLifecycle()
+
+            SettingsSection(title = "Auto-Backup & Preferences") {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -168,7 +173,7 @@ fun SettingsScreen(
                                 color = MaterialTheme.colorScheme.onSurface,
                             )
                             Text(
-                                text = "Checks every 15 min when connected",
+                                text = "Continuous camera roll scanning",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = Mist,
                             )
@@ -182,6 +187,140 @@ fun SettingsScreen(
                             checkedTrackColor = Aurora.copy(alpha = 0.3f),
                         ),
                     )
+                }
+
+                if (autoBackupEnabled) {
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.15f),
+                        modifier = Modifier.padding(vertical = 12.dp)
+                    )
+
+                    // Photos toggle
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column {
+                            Text(
+                                text = "Back up Photos",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            Text(
+                                text = "JPEG, PNG, WebP, HEIC",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Mist,
+                            )
+                        }
+                        Switch(
+                            checked = photosEnabled,
+                            onCheckedChange = { backupVm.setPhotosEnabled(it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Aurora,
+                                checkedTrackColor = Aurora.copy(alpha = 0.3f),
+                            ),
+                        )
+                    }
+
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.15f),
+                        modifier = Modifier.padding(vertical = 12.dp)
+                    )
+
+                    // Videos toggle
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column {
+                            Text(
+                                text = "Back up Videos",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            Text(
+                                text = "MP4, MKV, WebM",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Mist,
+                            )
+                        }
+                        Switch(
+                            checked = videosEnabled,
+                            onCheckedChange = { backupVm.setVideosEnabled(it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Aurora,
+                                checkedTrackColor = Aurora.copy(alpha = 0.3f),
+                            ),
+                        )
+                    }
+
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.15f),
+                        modifier = Modifier.padding(vertical = 12.dp)
+                    )
+
+                    // Wi-Fi only toggle
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column {
+                            Text(
+                                text = "Wi-Fi Only",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            Text(
+                                text = "Don't use mobile data for backup",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Mist,
+                            )
+                        }
+                        Switch(
+                            checked = wifiOnly,
+                            onCheckedChange = { backupVm.setWifiOnly(it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Aurora,
+                                checkedTrackColor = Aurora.copy(alpha = 0.3f),
+                            ),
+                        )
+                    }
+
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.15f),
+                        modifier = Modifier.padding(vertical = 12.dp)
+                    )
+
+                    // Battery-aware toggle
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column {
+                            Text(
+                                text = "Battery Aware",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            Text(
+                                text = "Pause when battery saver is on or battery < 15%",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Mist,
+                            )
+                        }
+                        Switch(
+                            checked = batteryAware,
+                            onCheckedChange = { backupVm.setBatteryAware(it) },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Aurora,
+                                checkedTrackColor = Aurora.copy(alpha = 0.3f),
+                            ),
+                        )
+                    }
                 }
             }
 

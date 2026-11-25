@@ -55,23 +55,32 @@ import kotlin.math.ceil
  *
  * [onDone] is invoked when all uploads complete and the user taps "Done".
  */
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+
 @Composable
 fun UploadScreen(
     onDone: () -> Unit,
+    onBack: () -> Unit = onDone,
     vm: UploadViewModel = hiltViewModel(),
 ) {
     val queue by vm.queue.collectAsStateWithLifecycle()
     val floodWaitState by vm.floodWaitState.collectAsStateWithLifecycle()
+    val activeSession by vm.activeSession.collectAsStateWithLifecycle()
+    val adaptiveFloodWait by vm.adaptiveFloodWaitState.collectAsStateWithLifecycle()
+
+    val effectiveFloodWait = if (floodWaitState is FloodWaitState.Waiting) floodWaitState else adaptiveFloodWait
 
     val doneCount      = remember(queue) { queue.count { it.state is UploadState.Done } }
     val totalCount     = remember(queue) { queue.size }
-    val hasActive      = remember(queue) { queue.any { it.state is UploadState.Uploading } }
     val isAllFinished  = remember(queue) {
         queue.isNotEmpty() && queue.none { it.state is UploadState.Queued || it.state is UploadState.Uploading }
     }
 
-    // Block back-press during active uploads
-    BackHandler(enabled = hasActive) { /* swallow — don't navigate away */ }
+    val persistentTasks by vm.persistentTasks.collectAsStateWithLifecycle()
+
+    val effectiveDoneCount = if (persistentTasks.isNotEmpty()) persistentTasks.count { it.state == "COMPLETED" } else doneCount
+    val effectiveTotalCount = if (persistentTasks.isNotEmpty()) persistentTasks.size else totalCount
+    val effectiveIsFinished = if (persistentTasks.isNotEmpty()) persistentTasks.all { it.state == "COMPLETED" || it.state == "FAILED" || it.state == "CANCELLED" } else isAllFinished
 
     Column(
         modifier = Modifier
@@ -80,17 +89,62 @@ fun UploadScreen(
             .windowInsetsPadding(WindowInsets.systemBars),
     ) {
         // ── Flood-wait banner (FR-BACKUP-STATUS-2) ────────────────────────────
-        FloodWaitBanner(floodWaitState)
+        FloodWaitBanner(effectiveFloodWait)
+
+        // ── Active Session Controls Banner ────────────────────────────────────
+        if (activeSession != null) {
+            val session = activeSession!!
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.padding(12.dp).fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            text = "${session.sessionType} Backup Session",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Status: ${session.status} (${session.completedItems} / ${session.totalItems} items)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Mist
+                        )
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (session.status == "ACTIVE") {
+                            IconButton(onClick = { vm.pauseBackup() }) {
+                                Icon(imageVector = Icons.Filled.HourglassBottom, contentDescription = "Pause")
+                            }
+                        } else if (session.status == "PAUSED") {
+                            IconButton(onClick = { vm.resumeBackup() }) {
+                                Icon(imageVector = Icons.Filled.Refresh, contentDescription = "Resume")
+                            }
+                        }
+                        IconButton(onClick = { vm.cancelBackup() }) {
+                            Icon(imageVector = Icons.Filled.Warning, contentDescription = "Cancel", tint = Ember)
+                        }
+                    }
+                }
+            }
+        }
 
         // ── Header ────────────────────────────────────────────────────────────
         UploadHeader(
-            doneCount     = doneCount,
-            totalCount    = totalCount,
-            isAllFinished = isAllFinished,
+            doneCount     = effectiveDoneCount,
+            totalCount    = effectiveTotalCount,
+            isAllFinished = effectiveIsFinished,
             onDone        = {
                 vm.clearQueue()
                 onDone()
             },
+            onBack        = onBack,
             modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
         )
 
@@ -120,6 +174,7 @@ private fun UploadHeader(
     totalCount: Int,
     isAllFinished: Boolean,
     onDone: () -> Unit,
+    onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier) {
@@ -127,6 +182,14 @@ private fun UploadHeader(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth(),
         ) {
+            IconButton(onClick = onBack, modifier = Modifier.padding(end = 8.dp)) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "Back",
+                    tint = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text  = "Backing up to Saved Messages",
